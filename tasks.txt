@@ -1,0 +1,369 @@
+import os
+import random
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+
+import httpx
+from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.encoders import jsonable_encoder
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
+
+from ..config.config import Kyro_Config
+from ..config.task_config import Task_Config
+from ..models.task import Task, TaskSearchResult, TaskUpdate
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+@router.on_event("startup")
+async def startup():
+    # TODO Prod conn string is set as an env var in cloud run. Need to use a secret manager
+    conn_str = os.environ.get(Kyro_Config.MONGO_URL, Kyro_Config.MONGO_LOCAL)
+    db_client = AsyncIOMotorClient(conn_str)
+    router.db_client = db_client
+
+
+# Method to inject the MongoDB organization collection as a dependency
+def get_task_coll() -> AsyncIOMotorCollection:
+    return router.db_client[Kyro_Config.DB_NAME][Kyro_Config.TASKS_COLL]
+
+
+def get_short_code(project: Union[str, dict]):
+    # TODO return one plus the largest number used so far
+    # We have not enforced the uniqueness yet
+    project_name = project["name"] if type(project) is dict else project
+    return f"{project_name}-{random.randint(1, 1000000)}"  # nosec
+
+
+def get_current_user(uid="system"):
+    return {"id": uid, "display_name": "system"}
+
+
+async def get_user_by_id(uid: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{Kyro_Config.USER_URL}/{uid}")
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="User Not Found")
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+        return response.json()
+
+
+def get_display_name(user_doc: dict):
+    if "display_name" in user_doc:
+        return {"id": user_doc["_id"], "display_name": user_doc["display_name"]}
+    return {"id": user_doc["_id"], "display_name": user_doc["email"]}
+
+
+async def get_subtasks(task_id: str, task_coll: AsyncIOMotorCollection) -> list:
+
+    doc = task_coll.find(
+        {"parent_id": task_id},
+        {
+            "parent_id": 1,
+            "status": 1,
+            "summary": 1,
+            "assignee": 1,
+            "short_code": 1,
+            "priority": 1,
+        },
+    )
+    subtasks = await doc.to_list(Task_Config.LIST_LENGTH)
+    return subtasks
+
+
+async def clone_subtasks(
+    original_task_id: str,
+    new_parent_id: str,
+    current_user: dict,
+    current_time: datetime,
+    task_coll: AsyncIOMotorCollection,
+):
+    subtasks = await get_subtasks(original_task_id, task_coll)
+    if not subtasks:
+        return []
+
+    subtask_ids = []
+
+    subtask_ids = [subtask["_id"] for subtask in subtasks]
+
+    docs = [
+        get_clone_task(subtask, current_user, current_time, new_parent_id)
+        async for subtask in task_coll.find({"_id": {"$in": subtask_ids}})
+    ]
+
+    if len(docs) != len(subtask_ids):
+        print("Internal Server Error")
+    result = await task_coll.insert_many(docs)
+    # TODO If insert_many fails after partial update
+
+    return result.inserted_ids
+
+
+async def move_subtask(task: dict, task_coll: AsyncIOMotorCollection):
+    if "project" in task and "parent_id" not in task:
+        raise HTTPException(status_code=400, detail="Cannot update project for subtask")
+
+    if "parent_id" in task:
+        parent_doc = await task_coll.find_one({"_id": task["parent_id"]})
+        if parent_doc is None:
+            raise HTTPException(status_code=404, detail="Parent task Not Found")
+        task["project"] = parent_doc["project"]
+
+    return task
+
+
+async def update_subtasks(
+    task: dict,
+    task_id: str,
+    task_coll: AsyncIOMotorCollection,
+    current_user=Depends(get_current_user),
+):
+    subtask_count = await task_coll.count_documents({"parent_id": task_id})
+    subtask_matched_count = 0
+    subtask_modified_count = 0
+    if "parent_id" in task and subtask_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Move/Delete existing subtasks before attempting to convert to subtask",
+        )
+
+    # Converting a main task to a subtask
+    if "parent_id" in task:
+        parent_doc = await task_coll.find_one({"_id": task["parent_id"]})
+        if parent_doc is None:
+            raise HTTPException(status_code=404, detail="Parent task Not Found")
+        if parent_doc["parent_id"] is not None:
+            raise HTTPException(
+                status_code=400, detail="Parent task cannot be a subtask"
+            )
+        # Overrides project given in the payload
+        task["project"] = parent_doc["project"]
+
+    elif "project" in task:
+        task["project"] = await get_project(task["project"])
+
+    # Update all subtasks with updated project info of main task if project is updated
+    if subtask_count > 0 and "project" in task:
+        subtask_result = await task_coll.update_many(
+            {"parent_id": task_id},
+            {
+                "$set": {
+                    "project": task["project"],
+                    "last_updated_at": datetime.now(),
+                    "last_updated_by": current_user,
+                }
+            },
+        )
+        subtask_matched_count = subtask_result.matched_count
+        subtask_modified_count = subtask_result.modified_count
+
+    return {
+        "task": task,
+        "matched": subtask_matched_count,
+        "modified": subtask_modified_count,
+    }
+
+
+async def delete_subtasks(
+    task_id: str, subtasks: bool, task_coll: AsyncIOMotorCollection
+):
+    subtask_count = await task_coll.count_documents({"parent_id": task_id})
+    subtask_deleted_count = 0
+    if not subtasks and subtask_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Subtasks are present set confirmation flag as true to delete",
+        )
+    if subtask_count > 0:
+        subtask_result = await task_coll.delete_many({"parent_id": task_id})
+        if subtask_result.deleted_count != subtask_count:
+            raise HTTPException(status_code=404, detail="subtasks not found")
+        subtask_deleted_count = subtask_result.deleted_count
+    return subtask_deleted_count
+
+@router.get(
+    "",
+    response_description="Search for tasks",
+    response_model=List[TaskSearchResult],
+)
+async def get_tasks(
+    short_code: Optional[str] = None,
+    summary: Optional[str] = None,
+    task_type: Optional[str] = None,
+    priority: Optional[int] = None,
+    assignee: Optional[str] = None,
+    label: Optional[str] = None,
+    status: Optional[str] = None,
+    project: Optional[str] = None,
+    parent_id: Optional[str] = None,
+    location: Optional[str] = None,
+    task_coll: AsyncIOMotorCollection = Depends(get_task_coll),
+):
+    filter_criteria: Dict[str, Any] = {}
+    params = locals()
+    attributes = ["short_code", "task_type", "priority", "status"]
+    for attribute in attributes:
+        if params[attribute]:
+            filter_criteria[attribute] = params[attribute]
+
+    if assignee:
+        filter_criteria["assignee.id"] = assignee
+
+    if project:
+        filter_criteria["project.id"] = project
+
+    if label:
+        filter_criteria["labels"] = label
+
+    if parent_id:
+        filter_criteria["parent_id"] = parent_id
+
+    if summary:
+        filter_criteria["summary"] = {"$regex": f".*{summary}.*", "$options": "i"}
+
+    filter_criteria |= get_user_org_filter()
+    tasks = []
+    async for task in task_coll.find(filter_criteria):
+        tasks.append(TaskSearchResult(**task))
+
+    return tasks
+
+
+@router.post("", response_description="Add a Task")
+async def add_task(
+    task: Task = Body(...),
+    task_coll: AsyncIOMotorCollection = Depends(get_task_coll),
+    current_user=Depends(get_current_user),
+):
+    # TODO Fix the short code generation. Not trivial right now
+
+    # To check if its a parent task
+    if task.parent_id:
+        doc = await task_coll.find_one({"_id": task.parent_id})
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Parent Task Not Found")
+        if doc["parent_id"] is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create subtask for a subtask",
+            )
+        if doc["project"]["id"] != task.project:
+            raise HTTPException(
+                status_code=422,
+                detail="Subtask should be in the same project as the Parent task",
+            )
+        task.project = doc["project"]
+    if type(task.assignee) is str:
+        user_doc = await get_user_by_id(task.assignee)
+        task.assignee = get_display_name(user_doc)
+    # Only get project name if it is a main task
+    if not task.parent_id:
+        task.project = await get_project(task.project)
+
+    task.short_code = get_short_code(task.project)
+
+    task_obj = jsonable_encoder(task)
+    result = await task_coll.insert_one(
+        {
+            **task_obj,
+            "created_by": current_user,
+            "created_at": datetime.now(),
+            "last_updated_at": datetime.now(),
+            "last_updated_by": current_user,
+        }
+    )
+    return {"task_id": str(result.inserted_id)}
+
+
+@router.get(
+    "/{task_id}",
+    response_description="Get Task Details",
+    response_model=Task,
+)
+async def get_task(
+    task_id: str, task_coll: AsyncIOMotorCollection = Depends(get_task_coll)
+):
+    # TODO Restrict the fields we send back. We may not want all the sub-collections
+    doc = await task_coll.find_one({"_id": task_id})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Task Not Found")
+    subtasks = await get_subtasks(task_id, task_coll)
+    doc["subtasks"] = subtasks
+    return doc
+
+
+@router.put("/{task_id}", response_description="Update Task details")
+async def update_task(
+    task_id: str,
+    task_to_update: TaskUpdate = Body(...),
+    task_coll=Depends(get_task_coll),
+    current_user=Depends(get_current_user),
+):
+    # https://fastapi.tiangolo.com/tutorial/body-updates/#using-pydantics-exclude_unset-parameter
+    doc = await task_coll.find_one({"_id": task_id})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Task Not Found")
+
+    task = task_to_update.dict(exclude_unset=True)
+    # if parent_task and update is empty
+    if not task:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one field required",
+        )
+
+    subtask_modified_count = 0
+    subtask_matched_count = 0
+
+    # TODO Implement the get_user to retrieve the user from user service
+    if "assignee" in task:
+        user_doc = await get_user_by_id(task["assignee"])
+        task["assignee"] = get_display_name(user_doc)
+
+    # if it is a parent task
+    if doc["parent_id"] is None:
+        result = await update_subtasks(task, task_id, task_coll)
+        task = result["task"]
+        subtask_modified_count = result["modified"]
+        subtask_matched_count = result["matched"]
+
+    # If it is a subtask
+    else:
+        task = await move_subtask(task, task_coll)
+
+    task_obj = jsonable_encoder(task)
+    # TODO Validations based on status, task_type, start_date, end_date etc.
+    result = await task_coll.update_one(
+        {"_id": task_id},
+        {
+            "$set": {
+                **task_obj,
+                "last_updated_at": datetime.now(),
+                "last_updated_by": current_user,
+            }
+        },
+    )
+
+    return {
+        "matched": result.matched_count + subtask_matched_count,
+        "modified": result.modified_count + subtask_modified_count,
+    }
+
+
+@router.delete("/{task_id}")
+async def delete_task(
+    task_id: str,
+    subtasks: bool = False,
+    task_coll: AsyncIOMotorCollection = Depends(get_task_coll),
+):
+    # TODO Check for dependencies before deleting
+
+    # To check if the task has subtasks
+    subtask_deleted_count = await delete_subtasks(task_id, subtasks, task_coll)
+
+    result = await task_coll.delete_one({"_id": task_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Task Not Found")
+
+    deleted_count = result.deleted_count + subtask_deleted_count
+    return {"deleted": deleted_count}
